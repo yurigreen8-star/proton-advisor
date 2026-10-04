@@ -1,0 +1,20 @@
+# Виртуальное окружение Python
+.venv/
+venv/
+
+# Скомпилированные файлы и кэш Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Файлы сборки PyInstaller
+build/
+dist/
+*.spec
+
+# Локальный кэш программы (чтобы не светить данные в гите)
+.cache/
+
+# Настройки IDE
+.vscode/
+.idea/

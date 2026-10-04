@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""
+ProtonAdvisor v5.4 (Robust Data Fetching)
+Исправлена проблема "пустых" результатов:
+1. Горизонт данных расширен до 3 лет (с аварийным снятием фильтра, если данных мало).
+2. Умный фоллбэк GPU: если нет отчётов под ваш GPU, показываются все доступные с предупреждением.
+3. Добавлено детальное логирование для отладки количества отчётов.
+"""
+
+import sys
+import json
+import re
+import time
+import logging
+import unicodedata
+# Подсказка для PyInstaller
+import requests
+import PySide6
+from pathlib import Path
+from collections import defaultdict, Counter
+
+import requests
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QLineEdit, QPushButton, QComboBox, QTextBrowser, QMessageBox, QCompleter
+)
+from PySide6.QtCore import Qt, QUrl
+
+CACHE_DIR         = Path.home() / ".cache" / "protonadvisor"
+GAMES_FILE        = CACHE_DIR / "games.json"
+CACHE_EXPIRY_DAYS = 30
+THREE_YEARS_SECONDS = 3 * 365 * 24 * 60 * 60
+
+SEARCH_INDEX_URL  = "https://raw.githubusercontent.com/mdeguzis/proton-pulse-web/gh-pages/search-index.json"
+REPORTS_URL       = "https://raw.githubusercontent.com/mdeguzis/proton-pulse-web/gh-pages/data/{appid}/latest.json"
+STEAM_SEARCH_URL  = "https://store.steampowered.com/api/storesearch/"
+STEAM_DETAILS_URL = "https://store.steampowered.com/api/appdetails?appids={appid}"
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ProtonAdvisor/5.4"}
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+def ensure_cache_dir():
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def is_cache_valid(filepath: Path) -> bool:
+    if not filepath.exists():
+        return False
+    return (time.time() - filepath.stat().st_mtime) / 86400 < CACHE_EXPIRY_DAYS
+
+def normalize_proton_version(version: str) -> str:
+    v = str(version).strip()
+    if not v:
+        return "Не определено"
+    if re.search(r"\bge\b", v, re.IGNORECASE):
+        m = re.search(r"(\d+(?:\.\d+)?(?:-\d+)?)", v)
+        return f"GE-Proton {m.group(1).replace('.', '-')}" if m else "GE-Proton"
+    if re.search(r"experimental", v, re.IGNORECASE):
+        return "Proton Experimental"
+    if re.search(r"hotfix", v, re.IGNORECASE):
+        return "Proton Hotfix"
+    m = re.search(r"(?:proton[\s\-]*)(\d+(?:\.\d+)?(?:[-\.]\d+)?)", v, re.IGNORECASE)
+    if m:
+        num = re.sub(r"^(\d+\.\d+)\.(\d+)$", r"\1-\2", m.group(1))
+        return f"Proton {num}"
+    return v
+
+def normalize_game_name(name: str) -> str:
+    s = unicodedata.normalize("NFKC", str(name))
+    s = s.casefold()
+    s = re.sub(r"[®™©℠]", "", s)
+    s = re.sub(r"[\[\]\(\)\{\}:,.;'\"!?\-–—_/\\]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+class DataManager:
+    @staticmethod
+    def get_games_list(force_update=False) -> dict:
+        if not force_update and is_cache_valid(GAMES_FILE):
+            with open(GAMES_FILE, encoding="utf-8") as f:
+                games = json.load(f)
+                if any(not k.isdigit() for k in games.keys()):
+                    force_update = True
+        
+        if not force_update and GAMES_FILE.exists():
+            with open(GAMES_FILE, encoding="utf-8") as f:
+                return json.load(f)
+
+        logging.info("Загрузка индекса игр...")
+        try:
+            r = requests.get(SEARCH_INDEX_URL, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            index = r.json()
+
+            games = {}
+            for entry in index:
+                if isinstance(entry, list) and len(entry) >= 2:
+                    appid, title = str(entry[0]), str(entry[1])
+                elif isinstance(entry, dict):
+                    appid = str(entry.get("appId", entry.get("appid", "")))
+                    title = entry.get("title", entry.get("name", ""))
+                else:
+                    continue
+                if appid and title and appid.isdigit():
+                    games[appid] = title
+
+            with open(GAMES_FILE, "w", encoding="utf-8") as f:
+                json.dump(games, f, ensure_ascii=False, indent=2)
+            logging.info(f"Загружено {len(games)} игр.")
+            return games
+        except Exception as e:
+            logging.warning(f"Ошибка загрузки: {e}")
+            if GAMES_FILE.exists():
+                with open(GAMES_FILE, encoding="utf-8") as f:
+                    return json.load(f)
+            return {"1091500": "Cyberpunk 2077", "42700": "Call of Duty: Black Ops", "1259420": "Days Gone", "200510": "XCOM: Enemy Unknown", "271590": "Grand Theft Auto V"}
+
+    @staticmethod
+    def get_name_by_appid(appid: str) -> str:
+        try:
+            r = requests.get(STEAM_DETAILS_URL.format(appid=appid), headers=HEADERS, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            app_data = data.get(str(appid), {})
+            if app_data.get("success"):
+                return app_data["data"].get("name", f"AppID {appid}")
+        except Exception:
+            pass
+        return f"AppID {appid}"
+
+    @staticmethod
+    def search_steam_game(query: str):
+        if len(query.strip()) < 2:
+            return None
+        try:
+            response = requests.get(
+                STEAM_SEARCH_URL,
+                params={"term": query, "l": "english", "cc": "US"},
+                headers=HEADERS,
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+            items = data.get("items", [])
+            
+            q_norm = normalize_game_name(query)
+            candidates = []
+
+            for item in items:
+                if not isinstance(item, dict) or item.get("type") not in (None, "app", "game"):
+                    continue
+                appid, name = str(item.get("id", "")), item.get("name", "")
+                if not appid.isdigit() or not name:
+                    continue
+                
+                n_norm = normalize_game_name(name)
+                if n_norm == q_norm:
+                    score = 100
+                elif n_norm.startswith(q_norm):
+                    score = 80
+                elif q_norm in n_norm:
+                    score = 60
+                else:
+                    q_words = set(q_norm.split())
+                    n_words = set(n_norm.split())
+                    overlap = len(q_words & n_words)
+                    if overlap >= max(1, len(q_words) // 2):
+                        score = 40 + overlap * 10
+                    else:
+                        score = 0
+
+                if score > 0:
+                    candidates.append((score, appid, name))
+
+            if not candidates:
+                return None
+            
+            candidates.sort(key=lambda x: (x[0], -len(x[2])), reverse=True)
+            return candidates[0][1], candidates[0][2]
+        except Exception as e:
+            logging.warning(f"Ошибка поиска в Steam: {e}")
+            return None
+
+    @staticmethod
+    def get_reports(appid: str, force_update=False) -> list:
+        cache_file = CACHE_DIR / f"reports_{appid}.json"
+        if not force_update and is_cache_valid(cache_file):
+            with open(cache_file, encoding="utf-8") as f:
+                return json.load(f)
+
+        logging.info(f"Загрузка отчётов для AppID: {appid}...")
+        try:
+            r = requests.get(REPORTS_URL.format(appid=appid), headers=HEADERS, timeout=15)
+            if r.status_code == 404:
+                logging.info(f"AppID {appid} отсутствует в дампе Proton Pulse.")
+                return []
+            r.raise_for_status()
+
+            data = r.json()
+            raw = data if isinstance(data, list) else data.get("reports", data.get("data", []))
+            logging.info(f"Всего сырых отчётов в дампе: {len(raw)}")
+
+            now = time.time()
+            # Расширили до 3 лет, чтобы не терять данные для игр с редкими отчётами
+            filtered = [rpt for rpt in raw if isinstance(rpt, dict) and now - rpt.get("timestamp", now) <= THREE_YEARS_SECONDS]
+            
+            # Аварийное снятие фильтра: если за 3 года ничего нет, берём всё, что есть
+            if not filtered and raw:
+                filtered = [rpt for rpt in raw if isinstance(rpt, dict)]
+                logging.info(f"Отчёты старше 3 лет или дата некорректна. Используем все доступные ({len(filtered)} шт.)")
+            else:
+                logging.info(f"Отчётов за последние 3 года: {len(filtered)} из {len(raw)}")
+            
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(filtered, f, ensure_ascii=False, indent=2)
+            return filtered
+        except Exception as e:
+            logging.warning(f"Ошибка сети: {e}")
+            if cache_file.exists():
+                with open(cache_file, encoding="utf-8") as f:
+                    return json.load(f)
+            return []
+
+_GPU_KW = {"amd": ["amd", "radeon", "radv"], "nvidia": ["nvidia", "geforce", "rtx", "gtx", "nouveau"], "intel": ["intel", "iris", "uhd", "arc", "xe"]}
+_ALL_GPU_KW = [kw for kws in _GPU_KW.values() for kw in kws]
+_RATING_SCORES = {"platinum": 4, "gold": 3, "silver": 2, "bronze": 1, "borked": 0}
+
+def analyze_reports(reports: list, user_gpu: str) -> dict:
+    keywords = _GPU_KW.get(user_gpu.lower(), [])
+    strict, neutral, other = [], [], []
+
+    for r in reports:
+        blob = " ".join([str(r.get("gpu", "")), str(r.get("gpuDriver", "")), str(r.get("os", "")), str(r.get("notes", ""))]).lower()
+        if any(kw in blob for kw in keywords):
+            strict.append(r)
+        elif not any(kw in blob for kw in _ALL_GPU_KW):
+            neutral.append(r)
+        else:
+            other.append(r)
+
+    # УМНЫЙ ФОЛЛБЭК: гарантируем, что пользователь увидит данные, если они вообще есть
+    if strict:
+        final_reports = strict
+        is_strict = True
+        warning_msg = ""
+    elif neutral:
+        final_reports = neutral
+        is_strict = False
+        warning_msg = f"<br>⚠️ <i>Специфичных отчётов для {user_gpu} не найдено. Показаны нейтральные отчёты (без указания GPU).</i>"
+    else:
+        final_reports = reports # Берём ВСЕ отчёты, если другие фильтры не сработали
+        is_strict = False
+        warning_msg = f"<br>⚠️ <i>Отчётов именно для {user_gpu} не найдено. Показаны данные на основе всех доступных отчётов.</i>"
+
+    proton_stats = defaultdict(lambda: {"total": 0, "score_sum": 0, "good_count": 0})
+    mesa_c, args_c = Counter(), Counter()
+
+    for r in final_reports:
+        ver = normalize_proton_version(r.get("protonVersion", ""))
+        rating = str(r.get("rating", "")).lower()
+        score = _RATING_SCORES.get(rating, 2)
+
+        proton_stats[ver]["total"] += 1
+        proton_stats[ver]["score_sum"] += score
+        if rating in ("platinum", "gold"):
+            proton_stats[ver]["good_count"] += 1
+
+        notes = str(r.get("notes", "")) + " " + str(r.get("os", ""))
+        m = re.search(r"mesa\s+([\d\.]+[-\w\.]*)", notes, re.IGNORECASE)
+        if m:
+            mesa_c[m.group(1)] += 1
+        for arg in re.findall(r"([A-Z_]+=\S+\s*%command%)", notes, re.IGNORECASE):
+            args_c[arg.strip()] += 1
+
+    def sort_key(ver):
+        s = proton_stats[ver]
+        if s["total"] < 2:
+            return (0.0, 0.0, 0)
+        good_ratio = s["good_count"] / s["total"]
+        avg_score = s["score_sum"] / s["total"]
+        confidence = s["total"] / (s["total"] + 3) # Штраф за малую выборку
+        return (good_ratio * confidence, avg_score, s["total"])
+
+    sorted_v = sorted(proton_stats, key=sort_key, reverse=True)
+    best_proton = sorted_v[0] if sorted_v else "Не определено"
+
+    breakdown = [f"{v} ({proton_stats[v]['good_count']} Gold/Plat из {proton_stats[v]['total']})" for v in sorted_v[:3]]
+
+    return {
+        "proton": best_proton,
+        "mesa": mesa_c.most_common(1)[0][0] if mesa_c else "Не указана в отчётах",
+        "launch_args": [a for a, _ in args_c.most_common(3)],
+        "total_reports": len(final_reports),
+        "is_strict": is_strict,
+        "proton_breakdown": breakdown,
+        "best_proton_stats": proton_stats.get(best_proton, {"total": 0, "good_count": 0}),
+        "warning_msg": warning_msg
+    }
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("ProtonAdvisor v5.4 🎮")
+        self.resize(760, 620)
+        ensure_cache_dir()
+        self.games_data = {}
+
+        root = QWidget()
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+
+        row1 = QHBoxLayout()
+        self.gpu_combo = QComboBox()
+        self.gpu_combo.addItems(["AMD", "NVIDIA", "Intel"])
+        row1.addWidget(QLabel("Ваш GPU:"))
+        row1.addWidget(self.gpu_combo)
+        lbl = QLabel(f"Кэш: {CACHE_DIR}")
+        lbl.setStyleSheet("color: gray; font-size: 11px;")
+        row1.addWidget(lbl)
+        row1.addStretch()
+        layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Название или AppID (например: gta v или 271590)…")
+        self.search_btn = QPushButton("Найти")
+        self.search_btn.clicked.connect(self.on_search)
+        self.search_input.returnPressed.connect(self.on_search)
+        self.search_input.textChanged.connect(self._on_text_changed)
+        row2.addWidget(self.search_input)
+        row2.addWidget(self.search_btn)
+        layout.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        btn_upd = QPushButton("🔄 Обновить базу игр")
+        btn_upd.clicked.connect(self.update_games_list)
+        row3.addWidget(btn_upd)
+        row3.addStretch()
+        layout.addLayout(row3)
+
+        self.result = QTextBrowser()
+        self.result.setOpenExternalLinks(True)
+        layout.addWidget(self.result)
+
+        self.result.anchorClicked.connect(self._on_anchor_clicked)
+
+        self._load_games()
+
+    def _load_games(self):
+        self.result.setText("⏳ Загрузка базы игр…")
+        QApplication.processEvents()
+        self.games_data = DataManager.get_games_list()
+
+        self.completer = QCompleter(sorted(self.games_data.values()), self)
+        self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self.completer.setMaxVisibleItems(15)
+        self.search_input.setCompleter(self.completer)
+
+        self.result.setText(
+            f"✅ База загружена: {len(self.games_data)} игр.\n\n"
+            "💡 <b>Как искать:</b>\n"
+            "  1. Начните вводить название (игнорируются ®, ™, : и т.д.).\n"
+            "  2. Если не найдено, программа сама спросит Steam.\n"
+            "  3. <b>Самый надёжный способ:</b> введите AppID (например, 271590)."
+        )
+
+    def update_games_list(self):
+        self.result.setText("⏳ Обновление базы…")
+        QApplication.processEvents()
+        self.games_data = DataManager.get_games_list(force_update=True)
+        self._load_games()
+        QMessageBox.information(self, "Готово", f"База обновлена: {len(self.games_data)} игр.")
+
+    def _on_text_changed(self, text: str):
+        if len(text) >= 2:
+            self.completer.complete()
+
+    def _on_anchor_clicked(self, url: QUrl):
+        if url.scheme() == "proton":
+            appid = url.host()
+            name = DataManager.get_name_by_appid(appid)
+            self._fetch_and_show(appid, name, "Выбор из списка Steam")
+
+    def on_search(self):
+        query = self.search_input.text().strip()
+        if not query:
+            return
+
+        if query.isdigit():
+            name = self.games_data.get(query)
+            if not name:
+                self.result.setText(f"⏳ Получаю название для AppID {query}…")
+                QApplication.processEvents()
+                name = DataManager.get_name_by_appid(query)
+            self._fetch_and_show(query, name, "Прямой ввод AppID")
+            return
+
+        q_norm = normalize_game_name(query)
+        exact, starts, partial = [], [], []
+        for appid, name in self.games_data.items():
+            n_norm = normalize_game_name(name)
+            if n_norm == q_norm:
+                exact.append((appid, name))
+            elif n_norm.startswith(q_norm):
+                starts.append((appid, name))
+            elif q_norm in n_norm:
+                partial.append((appid, name))
+
+        matches = exact + starts + partial
+        if matches:
+            self._fetch_and_show(matches[0][0], matches[0][1], "Локальная база")
+            return
+
+        self.result.setText(f"🔍 «{query}» не найдена локально. Ищу в Steam Store…")
+        QApplication.processEvents()
+
+        steam_match = DataManager.search_steam_game(query)
+        if not steam_match:
+            self.result.setHtml(
+                f"❌ <b>Игра «{query}» не найдена.</b><br><br>"
+                f"Steam Store не выдал подходящих результатов.<br>"
+                f"💡 <b>Совет:</b> введите числовой <b>AppID</b> из ссылки ProtonDB (например, <b>271590</b>)."
+            )
+            return
+
+        found_id, found_name = steam_match
+        self.games_data[found_id] = found_name
+        try:
+            with open(GAMES_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.games_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logging.warning(f"Не удалось сохранить в кэш: {e}")
+
+        self._fetch_and_show(found_id, found_name, "Steam Store (сохранено)")
+
+    def _fetch_and_show(self, appid: str, name: str, source: str):
+        self.result.setText(f"⏳ Анализ: {name} (AppID: {appid})…")
+        QApplication.processEvents()
+
+        reports = DataManager.get_reports(appid)
+        if not reports:
+            self.result.setHtml(
+                f"⚠️ <b>В базе отчётов пока нет данных для {name}.</b><br>"
+                f"Игра найдена (AppID: {appid}), но сообщество ещё не оставило отчётов в открытом дампе.<br><br>"
+                f"<a href='https://www.protondb.com/app/{appid}'>Проверить наличие отчётов напрямую на ProtonDB</a>"
+            )
+            return
+
+        gpu = self.gpu_combo.currentText()
+        data = analyze_reports(reports, gpu)
+
+        if data["total_reports"] == 0:
+            self.result.setHtml(f"⚠️ <b>Нет отчётов</b> для {name} + {gpu} GPU.")
+            return
+
+        args_text = "<br>&nbsp;&nbsp;&nbsp;".join(data["launch_args"]) if data["launch_args"] else "Специальные параметры не требуются (работает из коробки)"
+        breakdown = "<br>&nbsp;&nbsp;&nbsp;".join(data["proton_breakdown"])
+        link = f"https://www.protondb.com/app/{appid}"
+        stats = data["best_proton_stats"]
+        reliability = int(stats["good_count"] / stats["total"] * 100) if stats["total"] else 0
+
+        self.result.setHtml(f"""
+<b>🎮 {name}</b> <span style="color:gray;font-size:11px;">(AppID: {appid} | Источник: {source})</span><br><br>
+<b>✅ Рекомендуемая связка:</b><br>
+&nbsp;&nbsp;&nbsp;Proton: <b>{data["proton"]}</b><br>
+&nbsp;&nbsp;&nbsp;Mesa: {data["mesa"]}<br><br>
+<b>⚙️ Параметры запуска:</b><br>
+&nbsp;&nbsp;&nbsp;{args_text}<br><br>
+<b>📊 Надёжность:</b> {reliability}% ({stats['good_count']} Gold/Platinum из {stats['total']} отчётов).{data['warning_msg']}<br><br>
+<b>📈 Топ версий:</b><br>
+&nbsp;&nbsp;&nbsp;{breakdown}<br><br>
+<b>🔗 Подробнее:</b> <a href="{link}">{link}</a>
+""")
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
